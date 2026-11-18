@@ -25,7 +25,7 @@ constexpr wchar_t kPreviewDefaultFont[] = L"Segoe UI";
 constexpr wchar_t kDefaultFontLabel[] = L"기본 글꼴";
 constexpr wchar_t kShortcutHint[] = L"항목을 더블클릭하거나 변경을 누른 뒤 새 키를 누르세요.";
 
-constexpr int kGeneralPage[] = {IDC_MOVE_GROUP, IDC_SEEK_LABEL, IDC_SEEK_EDIT, IDC_SEEK_SPIN, IDC_SEEK_UNIT,
+constexpr int kGeneralPage[] = {IDC_MOVE_GROUP, IDC_SEEK_LABEL, IDC_SEEK_EDIT, IDC_SEEK_SPIN, IDC_SEEK_UNIT, IDC_PLAYLIST_FIT,
                                 IDC_ASSOC_GROUP, IDC_ASSOC_STATUS, IDC_ASSOC_HINT, IDC_ASSOC_REGISTER,
                                 IDC_ASSOC_UNREGISTER, IDC_ASSOC_DEFAULTS};
 constexpr int kSubtitlePage[] = {IDC_FONT_LABEL, IDC_FONT_COMBO, IDC_SIZE_LABEL, IDC_SIZE_EDIT, IDC_SIZE_SPIN,
@@ -148,6 +148,7 @@ void SettingsDialog::Initialize() {
 
     FillFontList();
     FillOutlineList();
+    CheckDlgButton(dialog_, IDC_PLAYLIST_FIT, working_.fitWindowOnPlaylistChange ? BST_CHECKED : BST_UNCHECKED);
     UpdatePreview();
     UpdateAssociationState();
 
@@ -276,6 +277,12 @@ void SettingsDialog::HandleCommand(int id, int code) {
         break;
     case IDC_ASSOC_DEFAULTS:
         OpenDefaultAppsSettings();
+        break;
+    case IDC_PLAYLIST_FIT:
+        if (code == BN_CLICKED) {
+            working_.fitWindowOnPlaylistChange = IsDlgButtonChecked(dialog_, IDC_PLAYLIST_FIT) == BST_CHECKED;
+            UpdateApplyButton();
+        }
         break;
     case IDC_SHORTCUT_CHANGE:
         if (const int row = SelectedRow(); row >= 0) {

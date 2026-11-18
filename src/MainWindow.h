@@ -9,7 +9,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "ContextMenu.h"
 #include "ControlBar.h"
 #include "MpvPlayer.h"
 #include "Settings.h"
@@ -36,6 +38,8 @@ public:
     // The same for a file given from outside, by Explorer or the command line. There a
     // subtitle means "play this", so it opens its video, not just adds to what's playing.
     void OpenFromExplorer(const std::wstring& path);
+    // Several files make a playlist. One video becomes a playlist of its series.
+    void OpenFiles(const std::vector<std::wstring>& paths);
 
 private:
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -60,6 +64,17 @@ private:
     void RunDialog(const std::function<void()>& show);
     void OpenSettings();
     void ShowChapterList();
+    // Starts a new playlist at index, and looks for the rest of the series if asked to.
+    void StartPlaylist(std::vector<std::wstring> files, size_t index, const std::wstring& preferredSubtitle, bool findSeries);
+    void PlayPlaylistItem(size_t index);
+    void PlayNext(bool automatic);
+    void PlayPrevious();
+    void ShowPlaylist();
+    // At the cursor, or centered on the window if the cursor is outside it.
+    PopupPlace PopupPlaceForKeys() const;
+    void FindSeriesInBackground();
+    void HandleSeriesFound(LPARAM result);
+    void ApplyRepeatMode();
     void SeekWithPreview(double target, bool exact);
     void ApplyPreferences(const Preferences& preferences);
     // preferredSubtitle, if given, is selected over any other subtitle once the video is ready.
@@ -108,6 +123,12 @@ private:
 
     std::wstring currentVideoPath_;
     std::wstring pendingSubtitleName_;  // The file name of the subtitle to select once the video is ready.
+
+    std::vector<std::wstring> playlist_;  // Not saved: it's gone when the app closes.
+    size_t playlistIndex_ = 0;
+    bool keepWindowSize_ = false;  // The next video comes from the playlist, so the window stays as it is.
+    ULONGLONG lastExplorerOpen_ = 0;  // When a video last came from Explorer, to group a multi-file selection.
+    unsigned seriesSearch_ = 0;  // Counts searches, so a late result for an old playlist is ignored.
 
     std::wstring dropRetryPath_;  // The dropped video being opened. Empty once it's settled.
     size_t dropRetryCount_ = 0;

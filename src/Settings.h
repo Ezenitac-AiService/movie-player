@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "MpvPlayer.h"
+#include "Playlist.h"
 #include "Shortcuts.h"
 
 inline constexpr int kMinSeekSeconds = 1;
@@ -20,6 +21,10 @@ struct Preferences {
     int seekSeconds = 5;
     SubtitleStyle subtitleStyle;
     ShortcutTable shortcuts = DefaultShortcuts();
+    bool autoAdvance = true;  // Play the next file in the playlist when one ends.
+    RepeatMode repeat = RepeatMode::None;
+    // Moving to another file in the playlist keeps the window's size unless this is on.
+    bool fitWindowOnPlaylistChange = false;
 
     bool operator==(const Preferences&) const = default;
 };

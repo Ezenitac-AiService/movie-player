@@ -46,6 +46,9 @@ constexpr std::array<ShortcutInfo, kShortcutCount> kShortcuts{{
     {L"WindowSize100", L"화면 크기 100%", '2', false},
     {L"WindowSize150", L"화면 크기 150%", '3', false},
     {L"WindowSize200", L"화면 크기 200%", '4', false},
+    {L"PlaylistShow", L"재생 목록", VK_F6, false},
+    {L"PlaylistNext", L"다음 파일", VK_NEXT, false},
+    {L"PlaylistPrevious", L"이전 파일", VK_PRIOR, false},
 }};
 
 std::wstring KeyName(int key) {

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
 // The file types the app offers to open, here and in Windows' "Open with" list.
 inline constexpr std::array<const wchar_t*, 17> kVideoExtensions{
@@ -13,8 +14,9 @@ inline constexpr std::array<const wchar_t*, 17> kVideoExtensions{
 
 inline constexpr std::array<const wchar_t*, 7> kSubtitleExtensions{L".smi", L".sami", L".srt", L".ass", L".ssa", L".vtt", L".sub"};
 
-// These return an empty string if the user cancels.
-std::wstring PickVideoFile(HWND owner);
+// Several can be chosen. Returns nothing if the user cancels.
+std::vector<std::wstring> PickVideoFiles(HWND owner);
+// Returns an empty string if the user cancels.
 std::wstring PickSubtitleFile(HWND owner);
 
 // Decides by file extension, which is what tells a dropped subtitle from a video.

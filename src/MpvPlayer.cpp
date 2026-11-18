@@ -307,6 +307,10 @@ double MpvPlayer::ChangeSpeed(double delta) {
 
 // mpv fills in the position itself. The last one it reported can be slightly behind,
 // and an end point that playback has already passed never triggers the loop.
+void MpvPlayer::SetRepeatFile(bool repeat) {
+    Command({"set", "loop-file", repeat ? "inf" : "no"});
+}
+
 void MpvPlayer::SetLoopStart() {
     Command({"expand-properties", "set", "ab-loop-a", "${=time-pos}"});
 }

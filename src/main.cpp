@@ -5,6 +5,7 @@
 
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "FileDialogs.h"
 #include "MainWindow.h"
@@ -92,14 +93,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 0;
     }
 
+    std::vector<std::wstring> chosen;
     if (path.empty()) {
-        path = PickVideoFile(nullptr);
+        chosen = PickVideoFiles(nullptr);
     }
-    if (!path.empty()) {
+    if (!path.empty() || !chosen.empty()) {
         try {
             MainWindow window(instance, LoadSettings());
             window.Show(showCommand);
-            window.OpenFromExplorer(path);
+            if (chosen.empty()) {
+                window.OpenFromExplorer(path);
+            } else {
+                window.OpenFiles(chosen);
+            }
             exitCode = RunMessageLoop();
         } catch (const std::exception& error) {
             MessageBoxA(nullptr, error.what(), "Movie Player", MB_OK | MB_ICONERROR);

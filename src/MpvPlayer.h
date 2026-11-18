@@ -137,6 +137,8 @@ public:
     void SetLoopStart();
     void SetLoopEnd();
     void ClearLoop();
+    // Plays the current file over and over, instead of stopping at its end.
+    void SetRepeatFile(bool repeat);
     void SetLoop(double start, double end);
     // Pauses if playing, then moves by one frame.
     void StepFrame(bool forward);

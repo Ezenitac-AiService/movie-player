@@ -7,6 +7,7 @@
 #include <string>
 
 #include "MpvPlayer.h"
+#include "Playlist.h"
 #include "Shortcuts.h"
 
 // What the user picked from the right-click menu.
@@ -45,9 +46,24 @@ struct MenuChoice {
 // Shows the menu at a screen position and blocks until it closes. Playback keeps running.
 MenuChoice ShowContextMenu(HWND owner, POINT screenPoint, const PlaybackState& state, const ShortcutTable& shortcuts);
 
-// Shows the chapters, centered on a screen position, and blocks until it closes.
-// Returns the index of the one picked.
-std::optional<size_t> ShowChapterMenu(HWND owner, POINT screenCenter, const PlaybackState& state);
+// Where a popup list opens: with its top left corner at a screen point, or centered on it.
+struct PopupPlace {
+    POINT point{};
+    bool centered = false;
+};
+
+// Shows the chapters and blocks until the menu closes. Returns the index of the one picked.
+std::optional<size_t> ShowChapterMenu(HWND owner, PopupPlace place, const PlaybackState& state);
+
+struct PlaylistChoice {
+    enum class Action { None, Play, ToggleAutoAdvance, ToggleRepeatOne, ToggleRepeatAll };
+    Action action = Action::None;
+    size_t index = 0;  // The file to play.
+};
+
+// Shows the playlist and its play options, and blocks until the menu closes.
+PlaylistChoice ShowPlaylistMenu(HWND owner, PopupPlace place, const std::vector<std::wstring>& files, size_t current,
+                                bool autoAdvance, RepeatMode repeat);
 
 // A short human-readable name for a track, for menus and on-screen messages.
 std::wstring TrackLabel(const MediaTrack& track);

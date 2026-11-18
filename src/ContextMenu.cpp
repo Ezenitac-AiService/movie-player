@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cwchar>
+#include <filesystem>
 
 #include "TimeFormat.h"
 
@@ -213,7 +214,18 @@ MenuChoice ChoiceFromCommand(UINT command) {
 
 }  // namespace
 
-std::optional<size_t> ShowChapterMenu(HWND owner, POINT screenCenter, const PlaybackState& state) {
+namespace {
+
+UINT TrackAt(HMENU menu, HWND owner, PopupPlace place) {
+    // Windows moves the menu back on screen if it would go past a monitor's edge.
+    const UINT align = place.centered ? TPM_CENTERALIGN | TPM_VCENTERALIGN : TPM_LEFTALIGN | TPM_TOPALIGN;
+    SetForegroundWindow(owner);
+    return static_cast<UINT>(TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | align, place.point.x, place.point.y, 0, owner, nullptr));
+}
+
+}  // namespace
+
+std::optional<size_t> ShowChapterMenu(HWND owner, PopupPlace place, const PlaybackState& state) {
     HMENU menu = CreatePopupMenu();
     for (size_t i = 0; i < state.chapters.size(); ++i) {
         const Chapter& chapter = state.chapters[i];
@@ -221,11 +233,44 @@ std::optional<size_t> ShowChapterMenu(HWND owner, POINT screenCenter, const Play
         // Item ids start at 1, because 0 means nothing was picked.
         AddItem(menu, static_cast<UINT>(i) + 1, EscapeForMenu(chapter.title) + L"\t" + FormatTime(chapter.time), current);
     }
-    SetForegroundWindow(owner);
-    const UINT command = static_cast<UINT>(TrackPopupMenu(menu, TPM_RETURNCMD | TPM_CENTERALIGN | TPM_VCENTERALIGN, screenCenter.x,
-                                                           screenCenter.y, 0, owner, nullptr));
+    const UINT command = TrackAt(menu, owner, place);
     DestroyMenu(menu);
     return command == 0 ? std::nullopt : std::optional<size_t>(command - 1);
+}
+
+PlaylistChoice ShowPlaylistMenu(HWND owner, PopupPlace place, const std::vector<std::wstring>& files, size_t current,
+                                bool autoAdvance, RepeatMode repeat) {
+    constexpr UINT kAutoAdvance = 1;
+    constexpr UINT kRepeatOne = 2;
+    constexpr UINT kRepeatAll = 3;
+    constexpr UINT kFileBase = 100;
+    HMENU menu = CreatePopupMenu();
+    AddItem(menu, kAutoAdvance, L"다음 파일 자동 재생", autoAdvance);
+    AddItem(menu, kRepeatOne, L"한 개 반복", repeat == RepeatMode::One);
+    AddItem(menu, kRepeatAll, L"전체 목록 반복", repeat == RepeatMode::All);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    if (files.empty()) {
+        AddItem(menu, 0, L"재생 목록이 비어 있습니다", false, false);
+    }
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::wstring name = std::filesystem::path(files[i]).filename().wstring();
+        AddItem(menu, kFileBase + static_cast<UINT>(i), std::to_wstring(i + 1) + L". " + EscapeForMenu(name), i == current);
+    }
+    const UINT command = TrackAt(menu, owner, place);
+    DestroyMenu(menu);
+
+    PlaylistChoice choice;
+    if (command == kAutoAdvance) {
+        choice.action = PlaylistChoice::Action::ToggleAutoAdvance;
+    } else if (command == kRepeatOne) {
+        choice.action = PlaylistChoice::Action::ToggleRepeatOne;
+    } else if (command == kRepeatAll) {
+        choice.action = PlaylistChoice::Action::ToggleRepeatAll;
+    } else if (command >= kFileBase) {
+        choice.action = PlaylistChoice::Action::Play;
+        choice.index = command - kFileBase;
+    }
+    return choice;
 }
 
 const wchar_t* AspectLabel(AspectMode aspect) {

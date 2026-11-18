@@ -7,7 +7,9 @@
 #include <cwchar>
 #include <iterator>
 #include <stdexcept>
+#include <memory>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,18 @@ constexpr int kMinVideoWidth = 320;
 constexpr UINT_PTR kIdleTimer = 1;
 constexpr UINT kIdleDelayMs = 2000;
 constexpr UINT_PTR kDropRetryTimer = 3;
+constexpr UINT_PTR kSeriesTimer = 4;
+constexpr UINT WM_SERIES_FOUND = WM_APP + 2;
+// Explorer opens each of several selected files as its own copy of the app, which hands
+// the file to this window. Files arriving this close together are one selection.
+constexpr UINT kExplorerBatchMs = 1500;
+
+// A background search's answer, handed to the window with WM_SERIES_FOUND.
+struct SeriesResult {
+    unsigned search;
+    std::wstring video;
+    std::vector<std::wstring> series;
+};
 // Right after a drag from Explorer, a file on a virtual drive such as RaiDrive can open
 // but not yet give its real contents. Opening the same path without a drag works.
 constexpr UINT kDropRetryDelaysMs[] = {500, 1000, 2000};
@@ -125,6 +139,7 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
     callbacks.videoReady = [this](int width, int height) { HandleVideoReady(width, height); };
     player_ = std::make_unique<MpvPlayer>(videoWindow_, std::move(callbacks), settings.volume, settings.subtitleEncoding,
                                           settings.videoAdjustments, settings.preferences.subtitleStyle);
+    ApplyRepeatMode();
 }
 
 void MainWindow::Show(int showCommand) {
@@ -147,25 +162,206 @@ void MainWindow::HandlePlaybackError(const std::wstring& reason, bool unrecogniz
 void MainWindow::Open(const std::wstring& path) {
     KillTimer(window_, kDropRetryTimer);
     dropRetryPath_.clear();
+    lastExplorerOpen_ = 0;
     if (IsSubtitleFile(path)) {
         AddSubtitle(path);
+        ShowControls();
     } else {
-        OpenVideo(path);
+        StartPlaylist({path}, 0, {}, true);
     }
+}
+
+void MainWindow::OpenFiles(const std::vector<std::wstring>& paths) {
+    std::vector<std::wstring> videos;
+    for (const std::wstring& path : paths) {
+        if (!IsSubtitleFile(path)) {
+            videos.push_back(path);
+        }
+    }
+    if (videos.size() == 1) {
+        Open(videos.front());
+    } else if (videos.empty()) {
+        for (const std::wstring& path : paths) {
+            Open(path);
+        }
+    } else {
+        KillTimer(window_, kDropRetryTimer);
+        dropRetryPath_.clear();
+        lastExplorerOpen_ = 0;
+        SortByName(videos);
+        StartPlaylist(std::move(videos), 0, {}, false);
+    }
+}
+
+void MainWindow::StartPlaylist(std::vector<std::wstring> files, size_t index, const std::wstring& preferredSubtitle, bool findSeries) {
+    playlist_ = std::move(files);
+    playlistIndex_ = index;
+    keepWindowSize_ = false;
+    ++seriesSearch_;
+    KillTimer(window_, kSeriesTimer);
+    OpenVideo(playlist_[playlistIndex_], preferredSubtitle);
     ShowControls();
+    // The file plays at once; the rest of its series is looked for after a moment, which
+    // also leaves time for more files of a selection to arrive from Explorer.
+    if (findSeries) {
+        SetTimer(window_, kSeriesTimer, kExplorerBatchMs, nullptr);
+    }
+}
+
+void MainWindow::FindSeriesInBackground() {
+    if (playlist_.empty()) {
+        return;
+    }
+    const unsigned search = seriesSearch_;
+    const std::wstring video = playlist_[playlistIndex_];
+    // Reading a folder on a network drive can take seconds, so it's done off the UI thread.
+    std::thread([window = window_, search, video] {
+        auto result = std::make_unique<SeriesResult>(SeriesResult{search, video, FindSeries(video)});
+        if (PostMessageW(window, WM_SERIES_FOUND, 0, reinterpret_cast<LPARAM>(result.get()))) {
+            result.release();
+        }
+    }).detach();
+}
+
+void MainWindow::HandleSeriesFound(LPARAM message) {
+    const std::unique_ptr<SeriesResult> result(reinterpret_cast<SeriesResult*>(message));
+    if (result->search != seriesSearch_ || playlist_.size() != 1 || _wcsicmp(playlist_.front().c_str(), result->video.c_str()) != 0) {
+        return;  // Something else was opened meanwhile.
+    }
+    const auto itself = std::find_if(result->series.begin(), result->series.end(),
+                                     [&](const std::wstring& path) { return _wcsicmp(path.c_str(), result->video.c_str()) == 0; });
+    if (itself != result->series.end()) {
+        playlistIndex_ = static_cast<size_t>(itself - result->series.begin());
+        playlist_ = std::move(result->series);
+    }
+}
+
+void MainWindow::PlayPlaylistItem(size_t index) {
+    if (index >= playlist_.size()) {
+        return;
+    }
+    KillTimer(window_, kDropRetryTimer);
+    dropRetryPath_.clear();
+    playlistIndex_ = index;
+    keepWindowSize_ = !preferences_.fitWindowOnPlaylistChange;
+    OpenVideo(playlist_[index]);
+    player_->ShowMessage(std::to_wstring(index + 1) + L"/" + std::to_wstring(playlist_.size()) + L": " +
+                         std::filesystem::path(playlist_[index]).filename().wstring());
+    ShowControls();
+}
+
+void MainWindow::PlayNext(bool automatic) {
+    if (playlist_.empty()) {
+        return;
+    }
+    if (playlistIndex_ + 1 < playlist_.size()) {
+        PlayPlaylistItem(playlistIndex_ + 1);
+    } else if (preferences_.repeat == RepeatMode::All) {
+        PlayPlaylistItem(0);
+    } else if (!automatic) {
+        player_->ShowMessage(L"마지막 파일입니다");
+    }
+}
+
+void MainWindow::PlayPrevious() {
+    if (playlist_.empty()) {
+        return;
+    }
+    if (playlistIndex_ > 0) {
+        PlayPlaylistItem(playlistIndex_ - 1);
+    } else if (preferences_.repeat == RepeatMode::All) {
+        PlayPlaylistItem(playlist_.size() - 1);
+    } else {
+        player_->ShowMessage(L"첫 파일입니다");
+    }
+}
+
+void MainWindow::ApplyRepeatMode() {
+    player_->SetRepeatFile(preferences_.repeat == RepeatMode::One);
+}
+
+PopupPlace MainWindow::PopupPlaceForKeys() const {
+    POINT cursor{};
+    RECT window{};
+    GetCursorPos(&cursor);
+    GetWindowRect(window_, &window);
+    if (PtInRect(&window, cursor)) {
+        return {cursor, false};
+    }
+    RECT client{};
+    GetClientRect(window_, &client);
+    POINT center{client.right / 2, client.bottom / 2};
+    ClientToScreen(window_, &center);
+    return {center, true};
+}
+
+void MainWindow::ShowPlaylist() {
+    const PopupPlace place = PopupPlaceForKeys();
+    menuOpen_ = true;
+    SetCursorHidden(false);
+    ShowControls();
+    const PlaylistChoice choice = ShowPlaylistMenu(window_, place, playlist_, playlistIndex_, preferences_.autoAdvance, preferences_.repeat);
+    menuOpen_ = false;
+    ShowControls();
+
+    const auto announce = [this](const wchar_t* name, bool on) { player_->ShowMessage(std::wstring(name) + (on ? L" 켬" : L" 끔")); };
+    switch (choice.action) {
+    case PlaylistChoice::Action::Play:
+        PlayPlaylistItem(choice.index);
+        return;
+    case PlaylistChoice::Action::ToggleAutoAdvance:
+        preferences_.autoAdvance = !preferences_.autoAdvance;
+        // Repeating the whole list means moving on, so it can't stay without that.
+        if (!preferences_.autoAdvance && preferences_.repeat == RepeatMode::All) {
+            preferences_.repeat = RepeatMode::None;
+        }
+        announce(L"다음 파일 자동 재생", preferences_.autoAdvance);
+        break;
+    case PlaylistChoice::Action::ToggleRepeatOne:
+        preferences_.repeat = preferences_.repeat == RepeatMode::One ? RepeatMode::None : RepeatMode::One;
+        announce(L"한 개 반복", preferences_.repeat == RepeatMode::One);
+        break;
+    case PlaylistChoice::Action::ToggleRepeatAll:
+        preferences_.repeat = preferences_.repeat == RepeatMode::All ? RepeatMode::None : RepeatMode::All;
+        if (preferences_.repeat == RepeatMode::All) {
+            preferences_.autoAdvance = true;
+        }
+        announce(L"전체 목록 반복", preferences_.repeat == RepeatMode::All);
+        break;
+    case PlaylistChoice::Action::None:
+        return;
+    }
+    ApplyRepeatMode();
+    SaveCurrentSettings();
 }
 
 void MainWindow::OpenFromExplorer(const std::wstring& path) {
     if (!IsSubtitleFile(path)) {
+        const ULONGLONG now = GetTickCount64();
+        const bool sameSelection = lastExplorerOpen_ != 0 && now - lastExplorerOpen_ < kExplorerBatchMs && !playlist_.empty();
+        if (sameSelection) {
+            // Several files were selected: they are the playlist, not the series of the first.
+            lastExplorerOpen_ = now;
+            ++seriesSearch_;
+            KillTimer(window_, kSeriesTimer);
+            const std::wstring playing = playlist_[playlistIndex_];
+            if (std::none_of(playlist_.begin(), playlist_.end(), [&](const std::wstring& p) { return _wcsicmp(p.c_str(), path.c_str()) == 0; })) {
+                playlist_.push_back(path);
+            }
+            SortByName(playlist_);
+            playlistIndex_ = static_cast<size_t>(std::find(playlist_.begin(), playlist_.end(), playing) - playlist_.begin());
+            return;
+        }
         Open(path);
+        lastExplorerOpen_ = now;
         return;
     }
     const std::wstring video = FindVideoForSubtitle(path);
     if (!video.empty() && _wcsicmp(video.c_str(), currentVideoPath_.c_str()) != 0) {
         KillTimer(window_, kDropRetryTimer);
         dropRetryPath_.clear();
-        OpenVideo(video, path);
-        ShowControls();
+        lastExplorerOpen_ = 0;
+        StartPlaylist({video}, 0, path, true);
     } else if (!currentVideoPath_.empty()) {
         // Its video is already playing, or it has none: use it with what's on screen.
         Open(path);
@@ -250,8 +446,10 @@ void MainWindow::HandleVideoReady(int width, int height) {
     videoWidth_ = width;
     videoHeight_ = height;
     const bool center = std::exchange(centerOnFirstFit_, false);
-    // The user's chosen fullscreen or maximized state takes priority.
-    if (!fullscreen_ && !IsZoomed(window_) && !IsIconic(window_)) {
+    const bool keepSize = std::exchange(keepWindowSize_, false);
+    // The user's chosen fullscreen or maximized state takes priority, and so does the
+    // size they gave the window for an earlier file in the playlist.
+    if (!keepSize && !fullscreen_ && !IsZoomed(window_) && !IsIconic(window_)) {
         FitWindowToVideo(1.0, center);
     }
 }
@@ -390,15 +588,12 @@ void MainWindow::ShowChapterList() {
         player_->ShowMessage(L"챕터가 없습니다");
         return;
     }
-    RECT client{};
-    GetClientRect(window_, &client);
-    POINT center{client.right / 2, client.bottom / 2};
-    ClientToScreen(window_, &center);
+    const PopupPlace place = PopupPlaceForKeys();
 
     menuOpen_ = true;
     SetCursorHidden(false);
     ShowControls();
-    const std::optional<size_t> picked = ShowChapterMenu(window_, center, playback_);
+    const std::optional<size_t> picked = ShowChapterMenu(window_, place, playback_);
     menuOpen_ = false;
     ShowControls();
 
@@ -508,7 +703,13 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (!dropRetryPath_.empty()) {
                 OpenVideo(dropRetryPath_);
             }
+        } else if (wParam == kSeriesTimer) {
+            KillTimer(window_, kSeriesTimer);
+            FindSeriesInBackground();
         }
+        return 0;
+    case WM_SERIES_FOUND:
+        HandleSeriesFound(lParam);
         return 0;
     case WM_SETCURSOR:
         if (cursorHidden_ && LOWORD(lParam) == HTCLIENT) {
@@ -722,6 +923,15 @@ void MainWindow::RunShortcut(ShortcutAction action) {
     case ShortcutAction::WindowSize200:
         SetWindowSizePercent(200);
         break;
+    case ShortcutAction::PlaylistShow:
+        ShowPlaylist();
+        break;
+    case ShortcutAction::PlaylistNext:
+        PlayNext(false);
+        break;
+    case ShortcutAction::PlaylistPrevious:
+        PlayPrevious();
+        break;
     case ShortcutAction::Count:
         break;
     }
@@ -868,9 +1078,9 @@ void MainWindow::HandleContextMenu(POINT screenPoint) {
 
     switch (choice.action) {
     case MenuChoice::Action::OpenVideo: {
-        const std::wstring path = PickVideoFile(window_);
-        if (!path.empty()) {
-            Open(path);
+        const std::vector<std::wstring> paths = PickVideoFiles(window_);
+        if (!paths.empty()) {
+            OpenFiles(paths);
         }
         break;
     }
@@ -1106,19 +1316,22 @@ void MainWindow::HandleIdleTimeout() {
 }
 
 void MainWindow::HandleDroppedFiles(HDROP drop) {
-    std::wstring path;
-    const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
-    if (length > 0) {
-        std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
-        DragQueryFileW(drop, 0, buffer.data(), length + 1);
-        path.assign(buffer.data(), length);
+    std::vector<std::wstring> paths;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < count; ++i) {
+        const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+        if (length > 0) {
+            std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+            DragQueryFileW(drop, i, buffer.data(), length + 1);
+            paths.emplace_back(buffer.data(), length);
+        }
     }
     DragFinish(drop);
 
-    if (!path.empty()) {
-        Open(path);
-        if (!IsSubtitleFile(path)) {
-            dropRetryPath_ = path;
+    if (!paths.empty()) {
+        OpenFiles(paths);
+        if (!playlist_.empty() && !IsSubtitleFile(paths.front())) {
+            dropRetryPath_ = playlist_[playlistIndex_];
             dropRetryCount_ = 0;
         }
         SetForegroundWindow(window_);
@@ -1126,6 +1339,7 @@ void MainWindow::HandleDroppedFiles(HDROP drop) {
 }
 
 void MainWindow::HandleStateChanged(const PlaybackState& state) {
+    const bool reachedEnd = state.atEnd && !playback_.atEnd && !state.fileName.empty();
     const bool delayChanged = state.subtitleDelay != playback_.subtitleDelay;
     const bool loopChanged = state.loopStart != playback_.loopStart || state.loopEnd != playback_.loopEnd;
     playback_ = state;
@@ -1174,6 +1388,10 @@ void MainWindow::HandleStateChanged(const PlaybackState& state) {
         }
     }
     controlBar_->SetPlayback(state);
+
+    if (reachedEnd && preferences_.autoAdvance && preferences_.repeat != RepeatMode::One) {
+        PlayNext(true);
+    }
 }
 
 void MainWindow::ToggleFullscreen() {

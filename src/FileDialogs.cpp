@@ -1,6 +1,8 @@
 #include "FileDialogs.h"
 
 #include <commdlg.h>
+#include <shobjidl.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -27,20 +29,37 @@ std::wstring PickFile(HWND owner, const wchar_t* filter, const wchar_t* title) {
 
 }  // namespace
 
-std::wstring PickVideoFile(HWND owner) {
-    std::wstring filter = L"동영상 파일";
-    filter.push_back(L'\0');
-    for (const wchar_t* extension : kVideoExtensions) {
-        filter += L"*";
-        filter += extension;
-        filter += L";";
+std::vector<std::wstring> PickVideoFiles(HWND owner) {
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        return {};
     }
-    filter.push_back(L'\0');
-    filter += L"모든 파일";
-    filter.push_back(L'\0');
-    filter += L"*.*";
-    filter.push_back(L'\0');
-    return PickFile(owner, filter.c_str(), L"재생할 동영상 선택");
+    std::wstring videos;
+    for (const wchar_t* extension : kVideoExtensions) {
+        videos += (videos.empty() ? L"*" : L";*") + std::wstring(extension);
+    }
+    const COMDLG_FILTERSPEC types[] = {{L"동영상 파일", videos.c_str()}, {L"모든 파일", L"*.*"}};
+    dialog->SetFileTypes(static_cast<UINT>(std::size(types)), types);
+    dialog->SetTitle(L"재생할 동영상 선택 (여러 개 선택하면 재생 목록이 됩니다)");
+    FILEOPENDIALOGOPTIONS options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+
+    Microsoft::WRL::ComPtr<IShellItemArray> items;
+    DWORD count = 0;
+    if (FAILED(dialog->Show(owner)) || FAILED(dialog->GetResults(&items)) || FAILED(items->GetCount(&count))) {
+        return {};
+    }
+    std::vector<std::wstring> paths;
+    for (DWORD i = 0; i < count; ++i) {
+        Microsoft::WRL::ComPtr<IShellItem> item;
+        PWSTR path = nullptr;
+        if (SUCCEEDED(items->GetItemAt(i, &item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+            paths.emplace_back(path);
+            CoTaskMemFree(path);
+        }
+    }
+    return paths;
 }
 
 std::wstring PickSubtitleFile(HWND owner) {

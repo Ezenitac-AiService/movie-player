@@ -49,6 +49,9 @@ enum class ShortcutAction {
     WindowSize100,
     WindowSize150,
     WindowSize200,
+    PlaylistShow,
+    PlaylistNext,
+    PlaylistPrevious,
     Count,
 };
 inline constexpr size_t kShortcutCount = static_cast<size_t>(ShortcutAction::Count);

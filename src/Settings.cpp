@@ -15,6 +15,7 @@ constexpr wchar_t kWindowSection[] = L"Window";
 constexpr wchar_t kVideoSection[] = L"Video";
 constexpr wchar_t kSubtitleSection[] = L"Subtitle";
 constexpr wchar_t kShortcutSection[] = L"Shortcuts";
+constexpr wchar_t kPlaylistSection[] = L"Playlist";
 constexpr std::array<const wchar_t*, kVideoAdjustmentCount> kAdjustmentKeys{L"Brightness", L"Contrast", L"Saturation", L"Hue", L"Gamma"};
 constexpr int kMaxAdjustment = 100;
 constexpr double kMaxVolume = 130.0;  // mpv's default volume-max.
@@ -121,6 +122,13 @@ Settings LoadSettings() {
         preferences.subtitleStyle.fontSize = fontSize;
     }
     std::array<bool, kShortcutCount> stored{};
+    const int autoAdvance = ReadInt(path, kPlaylistSection, L"AutoAdvance");
+    if (autoAdvance == 0 || autoAdvance == 1) {
+        preferences.autoAdvance = autoAdvance == 1;
+    }
+    const std::wstring repeat = ReadText(path, kPlaylistSection, L"Repeat");
+    preferences.repeat = repeat == L"one" ? RepeatMode::One : repeat == L"all" ? RepeatMode::All : RepeatMode::None;
+    preferences.fitWindowOnPlaylistChange = ReadInt(path, kPlaylistSection, L"FitWindow") == 1;
     const int heightPercent = ReadInt(path, kSubtitleSection, L"HeightPercent");
     if (heightPercent >= 0 && heightPercent <= kMaxSubtitleHeightPercent) {
         preferences.subtitleStyle.heightPercent = heightPercent;
@@ -182,6 +190,10 @@ void SaveSettings(const Settings& settings) {
     swprintf_s(outlineSize, L"%g", preferences.subtitleStyle.outlineSize);
     WriteText(path, kSubtitleSection, L"OutlineSize", outlineSize);
     WriteInt(path, kSubtitleSection, L"HeightPercent", preferences.subtitleStyle.heightPercent);
+    WriteInt(path, kPlaylistSection, L"AutoAdvance", preferences.autoAdvance ? 1 : 0);
+    WriteText(path, kPlaylistSection, L"Repeat",
+              preferences.repeat == RepeatMode::One ? L"one" : preferences.repeat == RepeatMode::All ? L"all" : L"none");
+    WriteInt(path, kPlaylistSection, L"FitWindow", preferences.fitWindowOnPlaylistChange ? 1 : 0);
     // Only changed keys are stored, so a future change to a default reaches everyone else.
     for (size_t i = 0; i < kShortcutCount; ++i) {
         const ShortcutInfo& info = AllShortcuts()[i];
