@@ -14,6 +14,7 @@
 #include "ContextMenu.h"
 #include "ControlBar.h"
 #include "MpvPlayer.h"
+#include "PlaylistPanel.h"
 #include "Settings.h"
 
 // The top-level window. It takes all keyboard and mouse input and turns it into
@@ -21,10 +22,8 @@
 // dedicated child window; the control bar is composited above it.
 class MainWindow {
 public:
-    // How a second copy of the app finds this one and hands it a file: a
-    // WM_COPYDATA message with this id, holding a UTF-16 path that may be empty.
+    // Each copy of the app has one window of this class. Copies find each other's by it.
     static constexpr wchar_t kClassName[] = L"MoviePlayer.MainWindow";
-    static constexpr ULONG_PTR kOpenPathMessageId = 0x4D505631;
 
     // Throws std::runtime_error if the window or the player can't be created.
     MainWindow(HINSTANCE instance, const Settings& settings);
@@ -57,7 +56,6 @@ private:
     void HandleIdleTimeout();
     void HandleDroppedFiles(HDROP drop);
     void HandleContextMenu(POINT screenPoint);
-    void HandleCopyData(const COPYDATASTRUCT& data);
     void HandleStateChanged(const PlaybackState& state);
 
     // Runs a blocking window over the video, keeping the bar and cursor out of its way.
@@ -70,6 +68,27 @@ private:
     void PlayNext(bool automatic);
     void PlayPrevious();
     void ShowPlaylist();
+    void ApplyPlaylistOption(PlaylistChoice::Action action);
+    // Empty while the file playing has been taken out of the list.
+    std::optional<size_t> CurrentPlaylistIndex() const;
+    void RefreshPlaylistPanel();
+    // Drops a series search under way, as the list has changed in another way.
+    void CancelSeriesSearch();
+    // Shows the file's name and place in the list, once it has opened and the list is known.
+    void AnnounceIfReady();
+    void RemoveFromPlaylist(const std::vector<size_t>& indices);
+    void MoveInPlaylist(const std::vector<size_t>& indices, size_t before);
+    // Finds the videos among the paths, in folders too, then adds them with WM_FILES_COLLECTED.
+    void InsertIntoPlaylist(const std::vector<std::wstring>& paths, size_t before);
+    void HandleFilesCollected(LPARAM result);
+    void TogglePlaylistPanel();
+    void OpenPlaylistPanel();
+    void ClosePlaylistPanel();
+    // Widens the window for the panel if the monitor has room, so it doesn't cover the video.
+    void PlacePanelBesideIfRoom();
+    void ResizePlaylistPanel(int width);
+    int PanelPixels() const;
+    bool PanelBesideVideo() const;
     // At the cursor, or centered on the window if the cursor is outside it.
     PopupPlace PopupPlaceForKeys() const;
     void FindSeriesInBackground();
@@ -81,7 +100,11 @@ private:
     void OpenVideo(const std::wstring& path, const std::wstring& preferredSubtitle = {});
     void AddSubtitle(const std::wstring& path);
     void RestoreWindowPosition(const Settings& settings);
-    void SaveCurrentSettings();
+    // Several copies can start together, one per file selected in Explorer, all at the
+    // saved position. One that would sit right on top of another moves down and right.
+    void MoveAwayFromOtherWindows();
+    // Writes the preferences too, but only those that differ from changedFrom.
+    void SaveCurrentSettings(const Preferences* changedFrom = nullptr);
     void LayoutChildren();
     void ShowControls();
     void CycleSubtitle();
@@ -118,6 +141,7 @@ private:
     HWND videoWindow_ = nullptr;
     std::unique_ptr<ControlBar> controlBar_;
     std::unique_ptr<MpvPlayer> player_;
+    std::unique_ptr<PlaylistPanel> playlistPanel_;
     PlaybackState playback_;
     Preferences preferences_;
 
@@ -128,9 +152,20 @@ private:
 
     std::vector<std::wstring> playlist_;  // Not saved: it's gone when the app closes.
     size_t playlistIndex_ = 0;
+    // The file playing was taken out of the list. playlistIndex_ is then where it was,
+    // which is the one that came after it.
+    bool currentRemoved_ = false;
+    unsigned playlistGeneration_ = 0;  // Counts new lists, so files dropped on an old one are ignored.
+
+    bool panelOpen_ = false;
+    // The window was widened for the panel. Otherwise it lies over the video.
+    bool panelBeside_ = false;
+    int panelWidth_ = kDefaultPlaylistPanelWidth;  // Device-independent pixels.
+    bool wasMaximized_ = false;
     bool keepWindowSize_ = false;  // The next video comes from the playlist, so the window stays as it is.
-    ULONGLONG lastExplorerOpen_ = 0;  // When a video last came from Explorer, to group a multi-file selection.
     unsigned seriesSearch_ = 0;  // Counts searches, so a late result for an old playlist is ignored.
+    bool seriesPending_ = false;
+    bool announcePending_ = false;  // A file was opened, and hasn't shown its name yet.
 
     // The video being opened, kept for another try in case it reads wrongly at first.
     // Empty once it has settled, or when it's on a drive that doesn't need this.
@@ -141,6 +176,9 @@ private:
     bool restoringPosition_ = false;
     bool startMaximized_ = false;
     bool centerOnFirstFit_ = false;
+    // Where the window would have opened, if it was moved out of another one's way.
+    std::optional<POINT> cascadedFrom_;
+    POINT cascadedTo_{};
     int videoWidth_ = 0;  // The open video's own size. 0 if it has none, or isn't ready yet.
     int videoHeight_ = 0;
 

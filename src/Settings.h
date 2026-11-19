@@ -15,6 +15,10 @@ inline constexpr int kMinSubtitleFontSize = 10;
 inline constexpr int kMaxSubtitleFontSize = 150;
 inline constexpr int kMaxSubtitleHeightPercent = 100;
 inline constexpr std::array<double, 10> kSubtitleOutlineSizes{0.0, 0.5, 1.0, kDefaultSubtitleOutlineSize, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
+// The playlist panel's width, in device-independent pixels.
+inline constexpr int kDefaultPlaylistPanelWidth = 300;
+inline constexpr int kMinPlaylistPanelWidth = 200;
+inline constexpr int kMaxPlaylistPanelWidth = 800;
 
 // What the settings window changes.
 struct Preferences {
@@ -38,6 +42,8 @@ struct Settings {
     std::optional<RECT> windowPosition;
     bool windowMaximized = false;
     std::array<int, kVideoAdjustmentCount> videoAdjustments{};
+    bool playlistPanelOpen = false;
+    int playlistPanelWidth = kDefaultPlaylistPanelWidth;
     Preferences preferences;
 };
 

@@ -164,7 +164,8 @@ public:
     void SetSubtitleStyle(const SubtitleStyle& style);
 
     // Shows a short message over the video.
-    void ShowMessage(const std::wstring& text);
+    // On the video's top-left corner, for mpv's usual time unless given one.
+    void ShowMessage(const std::wstring& text, int milliseconds = -1);
 
     void ProcessEvents();
 

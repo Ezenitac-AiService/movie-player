@@ -54,6 +54,47 @@ void SortByName(std::vector<std::wstring>& paths) {
     });
 }
 
+std::vector<std::wstring> CollectVideos(const std::vector<std::wstring>& paths) {
+    std::vector<std::filesystem::path> videos;
+    for (const std::wstring& item : paths) {
+        const std::filesystem::path path(item);
+        std::error_code error;
+        if (std::filesystem::is_directory(path, error)) {
+            const auto options = std::filesystem::directory_options::skip_permission_denied;
+            for (std::filesystem::recursive_directory_iterator it(path, options, error), end; !error && it != end; it.increment(error)) {
+                std::error_code fileError;
+                if (it->is_regular_file(fileError) && IsVideo(it->path())) {
+                    videos.push_back(it->path());
+                }
+            }
+        } else if (IsVideo(path)) {
+            videos.push_back(path);
+        }
+    }
+    // Folder by folder, each one's name compared like Explorer does, so a folder's own
+    // files come before those of its subfolders, and "2" comes before "10".
+    const auto comparePaths = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        auto x = a.begin();
+        auto y = b.begin();
+        for (; x != a.end() && y != b.end(); ++x, ++y) {
+            if (const int order = StrCmpLogicalW(x->c_str(), y->c_str()); order != 0) {
+                return order;
+            }
+        }
+        return x == a.end() ? (y == b.end() ? 0 : -1) : 1;
+    };
+    std::stable_sort(videos.begin(), videos.end(), [&](const std::filesystem::path& a, const std::filesystem::path& b) {
+        const int folders = comparePaths(a.parent_path(), b.parent_path());
+        return folders != 0 ? folders < 0 : StrCmpLogicalW(a.filename().c_str(), b.filename().c_str()) < 0;
+    });
+    std::vector<std::wstring> result;
+    result.reserve(videos.size());
+    for (const std::filesystem::path& video : videos) {
+        result.push_back(video.wstring());
+    }
+    return result;
+}
+
 std::vector<std::wstring> FindSeries(const std::wstring& video) {
     const std::filesystem::path videoPath(video);
     const std::wstring key = SeriesKey(videoPath.stem().wstring());

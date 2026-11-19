@@ -1,9 +1,11 @@
 #include "MainWindow.h"
 
+#include <dwmapi.h>
 #include <imm.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cwchar>
 #include <iterator>
 #include <stdexcept>
@@ -16,6 +18,7 @@
 #include "ContextMenu.h"
 #include "FileDialogs.h"
 #include "InfoDialog.h"
+#include "PlaylistPanel.h"
 #include "SettingsDialog.h"
 #include "SmiSubtitles.h"
 #include "TimeFormat.h"
@@ -40,17 +43,67 @@ constexpr int kMinVideoWidth = 320;
 constexpr UINT_PTR kIdleTimer = 1;
 constexpr UINT kIdleDelayMs = 2000;
 constexpr UINT_PTR kOpenRetryTimer = 3;
-constexpr UINT_PTR kSeriesTimer = 4;
 constexpr UINT WM_SERIES_FOUND = WM_APP + 2;
-// Explorer opens each of several selected files as its own copy of the app, which hands
-// the file to this window. Files arriving this close together are one selection.
-constexpr UINT kExplorerBatchMs = 1500;
+constexpr UINT WM_FILES_COLLECTED = WM_APP + 3;
+// How long a file that starts playing shows its name and place in the list.
+constexpr int kAnnounceMs = 3000;
+// Back from maximized, there may be room again to put the panel beside the video.
+constexpr UINT WM_PLACE_PANEL = WM_APP + 4;
+// Held by each copy of the app while it picks where its window goes, so two copies
+// starting together don't pick the same place.
+constexpr wchar_t kPlacementMutex[] = L"Local\\MoviePlayer.WindowPlacement";
+constexpr DWORD kPlacementWaitMs = 2000;
+constexpr int kCascadeStep = 32;  // Device-independent pixels.
+
+// Several windows can be open, each holding the preferences it started with or last
+// changed. Writing only what changed keeps it from undoing another window's changes.
+void TakeChangedPreferences(const Preferences& before, const Preferences& after, Preferences& stored) {
+    const auto take = [](const auto& old, const auto& changed, auto& kept) {
+        if (!(old == changed)) {
+            kept = changed;
+        }
+    };
+    take(before.seekSeconds, after.seekSeconds, stored.seekSeconds);
+    take(before.subtitleStyle, after.subtitleStyle, stored.subtitleStyle);
+    take(before.shortcuts, after.shortcuts, stored.shortcuts);
+    take(before.autoAdvance, after.autoAdvance, stored.autoAdvance);
+    take(before.repeat, after.repeat, stored.repeat);
+    take(before.fitWindowOnPlaylistChange, after.fitWindowOnPlaylistChange, stored.fitWindowOnPlaylistChange);
+}
+
+// The normal-position top-left corners of the app's other windows, in any copy of it.
+std::vector<POINT> OtherWindowCorners(HWND self) {
+    struct Search {
+        HWND self;
+        std::vector<POINT> corners;
+    } search{self, {}};
+    EnumWindows(
+        [](HWND window, LPARAM data) -> BOOL {
+            auto& search = *reinterpret_cast<Search*>(data);
+            wchar_t name[64];
+            WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+            if (window != search.self && GetClassNameW(window, name, 64) && wcscmp(name, MainWindow::kClassName) == 0 &&
+                GetWindowPlacement(window, &placement)) {
+                search.corners.push_back({placement.rcNormalPosition.left, placement.rcNormalPosition.top});
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.corners;
+}
 
 // A background search's answer, handed to the window with WM_SERIES_FOUND.
 struct SeriesResult {
     unsigned search;
     std::wstring video;
     std::vector<std::wstring> series;
+};
+
+// Videos dropped on the panel, found with WM_FILES_COLLECTED.
+struct CollectedFiles {
+    unsigned generation;  // Of the playlist they were dropped on.
+    size_t before;
+    std::vector<std::wstring> files;
 };
 // A file on a network share or on a drive that a program provides, such as RaiDrive, can
 // open but not yet give its real contents, especially right after a drag from Explorer.
@@ -135,7 +188,8 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
     RECT client{};
     GetClientRect(window_, &client);
     videoWindow_ = CreateWindowExW(
-        0, kVideoWindowClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        // Clipped by its siblings, so the playlist panel can lie over the video.
+        0, kVideoWindowClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         0, 0, client.right, client.bottom,
         window_, nullptr, instance, nullptr);
     if (!videoWindow_) {
@@ -151,7 +205,29 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
     EnableWindow(videoWindow_, FALSE);
 
     controlBar_ = std::make_unique<ControlBar>(window_);
+    PlaylistPanel::Callbacks panel;
+    panel.play = [this](size_t index) { PlayPlaylistItem(index); };
+    panel.remove = [this](const std::vector<size_t>& indices) { RemoveFromPlaylist(indices); };
+    panel.move = [this](const std::vector<size_t>& indices, size_t before) { MoveInPlaylist(indices, before); };
+    panel.insert = [this](const std::vector<std::wstring>& paths, size_t before) {
+        InsertIntoPlaylist(paths, before);
+        SetForegroundWindow(window_);
+    };
+    panel.toggle = [this](PlaylistPanel::Option option) {
+        ApplyPlaylistOption(option == PlaylistPanel::Option::AutoAdvance ? PlaylistChoice::Action::ToggleAutoAdvance
+                            : option == PlaylistPanel::Option::RepeatOne ? PlaylistChoice::Action::ToggleRepeatOne
+                                                                         : PlaylistChoice::Action::ToggleRepeatAll);
+    };
+    panel.close = [this] { ClosePlaylistPanel(); };
+    panel.resize = [this](int width) { ResizePlaylistPanel(width); };
+    playlistPanel_ = std::make_unique<PlaylistPanel>(window_, std::move(panel));
+    panelWidth_ = settings.playlistPanelWidth;
+
     RestoreWindowPosition(settings);
+    MoveAwayFromOtherWindows();
+    if (settings.playlistPanelOpen) {
+        OpenPlaylistPanel();
+    }
     LayoutChildren();
 
     MpvPlayer::Callbacks callbacks;
@@ -199,7 +275,6 @@ void MainWindow::CancelOpenRetry() {
 
 void MainWindow::Open(const std::wstring& path) {
     // A subtitle joins the video being opened, so it leaves a retry of that video alone.
-    lastExplorerOpen_ = 0;
     if (IsSubtitleFile(path)) {
         AddSubtitle(path);
         ShowControls();
@@ -222,7 +297,6 @@ void MainWindow::OpenFiles(const std::vector<std::wstring>& paths) {
             Open(path);
         }
     } else {
-        lastExplorerOpen_ = 0;
         SortByName(videos);
         StartPlaylist(std::move(videos), 0, {}, false);
     }
@@ -231,20 +305,225 @@ void MainWindow::OpenFiles(const std::vector<std::wstring>& paths) {
 void MainWindow::StartPlaylist(std::vector<std::wstring> files, size_t index, const std::wstring& preferredSubtitle, bool findSeries) {
     playlist_ = std::move(files);
     playlistIndex_ = index;
+    currentRemoved_ = false;
     keepWindowSize_ = false;
-    ++seriesSearch_;
-    KillTimer(window_, kSeriesTimer);
+    CancelSeriesSearch();
+    ++playlistGeneration_;
+    announcePending_ = true;
     OpenVideo(playlist_[playlistIndex_], preferredSubtitle);
     CancelOpenRetry();
     if (MayReadLate(playlist_[playlistIndex_])) {
         ArmOpenRetry(playlist_[playlistIndex_], preferredSubtitle);
     }
+    RefreshPlaylistPanel();
     ShowControls();
-    // The file plays at once; the rest of its series is looked for after a moment, which
-    // also leaves time for more files of a selection to arrive from Explorer.
+    // The file plays at once, while the rest of its series is looked for.
     if (findSeries) {
-        SetTimer(window_, kSeriesTimer, kExplorerBatchMs, nullptr);
+        FindSeriesInBackground();
     }
+}
+
+std::optional<size_t> MainWindow::CurrentPlaylistIndex() const {
+    if (currentRemoved_ || playlistIndex_ >= playlist_.size()) {
+        return std::nullopt;
+    }
+    return playlistIndex_;
+}
+
+void MainWindow::RefreshPlaylistPanel() {
+    if (playlistPanel_) {
+        playlistPanel_->SetItems(playlist_, CurrentPlaylistIndex());
+        playlistPanel_->SetOptions(preferences_.autoAdvance, preferences_.repeat);
+    }
+}
+
+void MainWindow::RemoveFromPlaylist(const std::vector<size_t>& indices) {
+    std::vector<bool> removed(playlist_.size(), false);
+    for (size_t index : indices) {
+        if (index < removed.size()) {
+            removed[index] = true;
+        }
+    }
+    const auto first = std::find(removed.begin(), removed.end(), true);
+    if (first == removed.end()) {
+        return;
+    }
+    CancelSeriesSearch();  // A series found now would undo the change.
+    // The file playing goes on, outside the list. What comes after it is next.
+    if (!currentRemoved_ && playlistIndex_ < removed.size() && removed[playlistIndex_]) {
+        currentRemoved_ = true;
+    }
+    std::vector<std::wstring> kept;
+    size_t removedBeforeCurrent = 0;
+    for (size_t i = 0; i < playlist_.size(); ++i) {
+        if (!removed[i]) {
+            kept.push_back(std::move(playlist_[i]));
+        } else if (i < playlistIndex_) {
+            ++removedBeforeCurrent;
+        }
+    }
+    playlist_ = std::move(kept);
+    playlistIndex_ -= removedBeforeCurrent;
+    RefreshPlaylistPanel();
+    // What took the first removed one's place, so Delete can go on down the list.
+    if (!playlist_.empty()) {
+        playlistPanel_->Select(std::min(static_cast<size_t>(first - removed.begin()), playlist_.size() - 1), 1);
+    }
+}
+
+void MainWindow::MoveInPlaylist(const std::vector<size_t>& indices, size_t before) {
+    std::vector<bool> moving(playlist_.size(), false);
+    for (size_t index : indices) {
+        if (index < moving.size()) {
+            moving[index] = true;
+        }
+    }
+    std::vector<size_t> moved;
+    std::vector<size_t> rest;
+    for (size_t i = 0; i < playlist_.size(); ++i) {
+        (moving[i] ? moved : rest).push_back(i);
+    }
+    if (moved.empty()) {
+        return;
+    }
+    before = std::min(before, playlist_.size());
+    // Where `before` ends up once the moved ones are out of the way.
+    const size_t movedAhead = static_cast<size_t>(std::count_if(moved.begin(), moved.end(), [&](size_t i) { return i < before; }));
+    const size_t at = std::min(before - movedAhead, rest.size());
+    std::vector<size_t> order(rest.begin(), rest.begin() + static_cast<std::ptrdiff_t>(at));
+    order.insert(order.end(), moved.begin(), moved.end());
+    order.insert(order.end(), rest.begin() + static_cast<std::ptrdiff_t>(at), rest.end());
+
+    CancelSeriesSearch();
+    std::vector<std::wstring> reordered;
+    size_t newIndex = playlistIndex_;  // Stays past the end if what played was the last and is gone.
+    for (size_t i = 0; i < order.size(); ++i) {
+        reordered.push_back(std::move(playlist_[order[i]]));
+        if (order[i] == playlistIndex_) {
+            newIndex = i;
+        }
+    }
+    playlist_ = std::move(reordered);
+    playlistIndex_ = newIndex;
+    RefreshPlaylistPanel();
+    playlistPanel_->Select(at, moved.size());
+}
+
+void MainWindow::InsertIntoPlaylist(const std::vector<std::wstring>& paths, size_t before) {
+    const unsigned generation = playlistGeneration_;
+    // Folders are read, all the way down, which can take seconds on a network drive.
+    std::thread([window = window_, generation, before, paths] {
+        auto result = std::make_unique<CollectedFiles>(CollectedFiles{generation, before, CollectVideos(paths)});
+        if (PostMessageW(window, WM_FILES_COLLECTED, 0, reinterpret_cast<LPARAM>(result.get()))) {
+            result.release();
+        }
+    }).detach();
+}
+
+void MainWindow::HandleFilesCollected(LPARAM message) {
+    const std::unique_ptr<CollectedFiles> result(reinterpret_cast<CollectedFiles*>(message));
+    if (result->generation != playlistGeneration_) {
+        return;  // Another list was started meanwhile.
+    }
+    if (result->files.empty()) {
+        player_->ShowMessage(L"재생 목록에 넣을 영상이 없습니다");
+        return;
+    }
+    const size_t at = std::min(result->before, playlist_.size());
+    const size_t count = result->files.size();
+    playlist_.insert(playlist_.begin() + static_cast<std::ptrdiff_t>(at), result->files.begin(), result->files.end());
+    // Put where the removed file playing was, they come next.
+    if (at < playlistIndex_ || (at == playlistIndex_ && !currentRemoved_)) {
+        playlistIndex_ += count;
+    }
+    CancelSeriesSearch();
+    RefreshPlaylistPanel();
+    playlistPanel_->Select(at, count);
+    player_->ShowMessage(L"재생 목록에 " + std::to_wstring(count) + L"개 추가");
+}
+
+int MainWindow::PanelPixels() const {
+    return MulDiv(panelWidth_, static_cast<int>(GetDpiForWindow(window_)), 96);
+}
+
+bool MainWindow::PanelBesideVideo() const {
+    return panelOpen_ && panelBeside_ && !fullscreen_ && !IsZoomed(window_);
+}
+
+void MainWindow::TogglePlaylistPanel() {
+    if (panelOpen_) {
+        ClosePlaylistPanel();
+    } else {
+        OpenPlaylistPanel();
+    }
+}
+
+void MainWindow::OpenPlaylistPanel() {
+    panelOpen_ = true;
+    panelBeside_ = false;
+    RefreshPlaylistPanel();
+    PlacePanelBesideIfRoom();
+    LayoutChildren();
+    playlistPanel_->Show(true);
+}
+
+void MainWindow::ClosePlaylistPanel() {
+    if (panelBeside_) {
+        // The window was widened for the panel, so it gives that width back.
+        const int panel = PanelPixels();
+        panelBeside_ = false;
+        WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+        if (fullscreen_) {
+            restorePlacement_.rcNormalPosition.right -= panel;
+        } else if (IsZoomed(window_) && GetWindowPlacement(window_, &placement)) {
+            placement.rcNormalPosition.right -= panel;
+            SetWindowPlacement(window_, &placement);
+        } else {
+            RECT bounds{};
+            GetWindowRect(window_, &bounds);
+            SetWindowPos(window_, nullptr, 0, 0, bounds.right - bounds.left - panel, bounds.bottom - bounds.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    panelOpen_ = false;
+    playlistPanel_->Show(false);
+    LayoutChildren();
+}
+
+void MainWindow::PlacePanelBesideIfRoom() {
+    if (!panelOpen_ || panelBeside_ || fullscreen_ || IsZoomed(window_) || IsIconic(window_)) {
+        return;
+    }
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    RECT bounds{};
+    if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor) || !GetWindowRect(window_, &bounds)) {
+        return;
+    }
+    // What can be seen of the window: its resize borders are invisible, and may hang off the monitor.
+    RECT visible = bounds;
+    if (FAILED(DwmGetWindowAttribute(window_, DWMWA_EXTENDED_FRAME_BOUNDS, &visible, sizeof(visible)))) {
+        visible = bounds;
+    }
+    const RECT& work = monitor.rcWork;
+    const int panel = PanelPixels();
+    if (visible.right - visible.left + panel > work.right - work.left) {
+        return;  // No room: the panel goes over the video, which keeps its size.
+    }
+    // Wider to the right, or moved left first if the monitor ends there.
+    const int shift = std::max(0, static_cast<int>(visible.right) + panel - static_cast<int>(work.right));
+    panelBeside_ = true;
+    SetWindowPos(window_, nullptr, bounds.left - shift, bounds.top, bounds.right - bounds.left + panel, bounds.bottom - bounds.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void MainWindow::ResizePlaylistPanel(int width) {
+    RECT client{};
+    GetClientRect(window_, &client);
+    // Some of the window stays for the video.
+    const int room = MulDiv(client.right, 96, static_cast<int>(GetDpiForWindow(window_))) - kMinPlaylistPanelWidth;
+    const int widest = std::max(kMinPlaylistPanelWidth, std::min(kMaxPlaylistPanelWidth, room));
+    panelWidth_ = std::clamp(width, kMinPlaylistPanelWidth, widest);
+    LayoutChildren();
 }
 
 void MainWindow::FindSeriesInBackground() {
@@ -253,6 +532,7 @@ void MainWindow::FindSeriesInBackground() {
     }
     const unsigned search = seriesSearch_;
     const std::wstring video = playlist_[playlistIndex_];
+    seriesPending_ = true;
     // Reading a folder on a network drive can take seconds, so it's done off the UI thread.
     std::thread([window = window_, search, video] {
         auto result = std::make_unique<SeriesResult>(SeriesResult{search, video, FindSeries(video)});
@@ -264,15 +544,43 @@ void MainWindow::FindSeriesInBackground() {
 
 void MainWindow::HandleSeriesFound(LPARAM message) {
     const std::unique_ptr<SeriesResult> result(reinterpret_cast<SeriesResult*>(message));
-    if (result->search != seriesSearch_ || playlist_.size() != 1 || _wcsicmp(playlist_.front().c_str(), result->video.c_str()) != 0) {
-        return;  // Something else was opened meanwhile.
+    if (result->search != seriesSearch_) {
+        return;  // Something else was opened meanwhile, or the list was changed.
+    }
+    seriesPending_ = false;
+    if (playlist_.size() != 1 || _wcsicmp(playlist_.front().c_str(), result->video.c_str()) != 0) {
+        AnnounceIfReady();
+        return;
     }
     const auto itself = std::find_if(result->series.begin(), result->series.end(),
                                      [&](const std::wstring& path) { return _wcsicmp(path.c_str(), result->video.c_str()) == 0; });
     if (itself != result->series.end()) {
         playlistIndex_ = static_cast<size_t>(itself - result->series.begin());
         playlist_ = std::move(result->series);
+        RefreshPlaylistPanel();
     }
+    AnnounceIfReady();
+}
+
+void MainWindow::CancelSeriesSearch() {
+    ++seriesSearch_;
+    if (std::exchange(seriesPending_, false)) {
+        AnnounceIfReady();
+    }
+}
+
+void MainWindow::AnnounceIfReady() {
+    // Once the file has opened, and the list it's in is known, so the count is right.
+    const std::optional<size_t> index = CurrentPlaylistIndex();
+    if (!announcePending_ || seriesPending_ || !index) {
+        return;
+    }
+    const std::wstring name = std::filesystem::path(playlist_[*index]).filename().wstring();
+    if (_wcsicmp(playback_.fileName.c_str(), name.c_str()) != 0 || !playback_.duration) {
+        return;
+    }
+    announcePending_ = false;
+    player_->ShowMessage(name + L"\n재생 목록 " + std::to_wstring(*index + 1) + L" / " + std::to_wstring(playlist_.size()), kAnnounceMs);
 }
 
 void MainWindow::PlayPlaylistItem(size_t index) {
@@ -280,14 +588,15 @@ void MainWindow::PlayPlaylistItem(size_t index) {
         return;
     }
     playlistIndex_ = index;
+    currentRemoved_ = false;
     keepWindowSize_ = !preferences_.fitWindowOnPlaylistChange;
     OpenVideo(playlist_[index]);
     CancelOpenRetry();
     if (MayReadLate(playlist_[index])) {
         ArmOpenRetry(playlist_[index], {});
     }
-    player_->ShowMessage(std::to_wstring(index + 1) + L"/" + std::to_wstring(playlist_.size()) + L": " +
-                         std::filesystem::path(playlist_[index]).filename().wstring());
+    announcePending_ = true;
+    RefreshPlaylistPanel();
     ShowControls();
 }
 
@@ -295,8 +604,10 @@ void MainWindow::PlayNext(bool automatic) {
     if (playlist_.empty()) {
         return;
     }
-    if (playlistIndex_ + 1 < playlist_.size()) {
-        PlayPlaylistItem(playlistIndex_ + 1);
+    // With the file playing taken out of the list, the one that followed it is in its place.
+    const size_t next = currentRemoved_ ? playlistIndex_ : playlistIndex_ + 1;
+    if (next < playlist_.size()) {
+        PlayPlaylistItem(next);
     } else if (preferences_.repeat == RepeatMode::All) {
         PlayPlaylistItem(0);
     } else if (!automatic) {
@@ -341,15 +652,21 @@ void MainWindow::ShowPlaylist() {
     menuOpen_ = true;
     SetCursorHidden(false);
     ShowControls();
-    const PlaylistChoice choice = ShowPlaylistMenu(window_, place, playlist_, playlistIndex_, preferences_.autoAdvance, preferences_.repeat);
+    const PlaylistChoice choice = ShowPlaylistMenu(window_, place, playlist_, CurrentPlaylistIndex().value_or(playlist_.size()),
+                                                   preferences_.autoAdvance, preferences_.repeat);
     menuOpen_ = false;
     ShowControls();
-
-    const auto announce = [this](const wchar_t* name, bool on) { player_->ShowMessage(std::wstring(name) + (on ? L" 켬" : L" 끔")); };
-    switch (choice.action) {
-    case PlaylistChoice::Action::Play:
+    if (choice.action == PlaylistChoice::Action::Play) {
         PlayPlaylistItem(choice.index);
-        return;
+    } else {
+        ApplyPlaylistOption(choice.action);
+    }
+}
+
+void MainWindow::ApplyPlaylistOption(PlaylistChoice::Action action) {
+    const auto announce = [this](const wchar_t* name, bool on) { player_->ShowMessage(std::wstring(name) + (on ? L" 켬" : L" 끔")); };
+    const Preferences before = preferences_;
+    switch (action) {
     case PlaylistChoice::Action::ToggleAutoAdvance:
         preferences_.autoAdvance = !preferences_.autoAdvance;
         // Repeating the whole list means moving on, so it can't stay without that.
@@ -369,41 +686,22 @@ void MainWindow::ShowPlaylist() {
         }
         announce(L"전체 목록 반복", preferences_.repeat == RepeatMode::All);
         break;
+    case PlaylistChoice::Action::Play:
     case PlaylistChoice::Action::None:
         return;
     }
     ApplyRepeatMode();
-    SaveCurrentSettings();
+    SaveCurrentSettings(&before);
+    RefreshPlaylistPanel();
 }
 
 void MainWindow::OpenFromExplorer(const std::wstring& path) {
     if (!IsSubtitleFile(path)) {
-        const ULONGLONG now = GetTickCount64();
-        const bool sameSelection = lastExplorerOpen_ != 0 && now - lastExplorerOpen_ < kExplorerBatchMs && !playlist_.empty();
-        if (sameSelection) {
-            // Several files were selected: they are the playlist, not the series of the first.
-            lastExplorerOpen_ = now;
-            ++seriesSearch_;
-            KillTimer(window_, kSeriesTimer);
-            const std::wstring playing = playlist_[playlistIndex_];
-            if (std::none_of(playlist_.begin(), playlist_.end(), [&](const std::wstring& p) { return _wcsicmp(p.c_str(), path.c_str()) == 0; })) {
-                playlist_.push_back(path);
-            }
-            SortByName(playlist_);
-            playlistIndex_ = static_cast<size_t>(std::find(playlist_.begin(), playlist_.end(), playing) - playlist_.begin());
-            return;
-        }
         Open(path);
-        lastExplorerOpen_ = now;
         return;
     }
-    const std::wstring video = FindVideoForSubtitle(path);
-    if (!video.empty() && _wcsicmp(video.c_str(), currentVideoPath_.c_str()) != 0) {
-        lastExplorerOpen_ = 0;
+    if (const std::wstring video = FindVideoForSubtitle(path); !video.empty()) {
         StartPlaylist({video}, 0, path, true);
-    } else if (!currentVideoPath_.empty()) {
-        // Its video is already playing, or it has none: use it with what's on screen.
-        Open(path);
     } else {
         const std::wstring text = L"이 자막과 이름이 같은 영상 파일을 찾을 수 없습니다.\n\n" + path;
         MessageBoxW(window_, text.c_str(), kAppTitle, MB_OK | MB_ICONINFORMATION);
@@ -523,17 +821,25 @@ void MainWindow::FitWindowToVideo(double requestedScale, bool center) {
     scale = std::min({scale, static_cast<double>(workWidth) / videoWidth, static_cast<double>(workHeight - titleHeight) / videoHeight});
     const int pictureWidth = static_cast<int>(std::lround(videoWidth * scale));
     const int pictureHeight = static_cast<int>(std::lround(videoHeight * scale));
+    // The panel goes beside the picture if the monitor has room for both. Otherwise it goes
+    // over the picture, which never gets smaller for it.
+    const int panel = PanelPixels();
+    if (panelOpen_) {
+        panelBeside_ = pictureWidth + panel <= workWidth;
+    }
+    const int contentWidth = pictureWidth + (panelOpen_ && panelBeside_ ? panel : 0);
 
     RECT current{};
     GetWindowRect(window_, &current);
-    const int pictureLeft = center ? work.left + (workWidth - pictureWidth) / 2
+    const int pictureLeft = center ? work.left + (workWidth - contentWidth) / 2
                                    : std::clamp(static_cast<int>(current.left - frame.left), static_cast<int>(work.left),
-                                                static_cast<int>(work.right) - pictureWidth);
+                                                static_cast<int>(work.right) - contentWidth);
     const int top = center ? work.top + (workHeight - titleHeight - pictureHeight) / 2
                            : std::clamp(static_cast<int>(current.top), static_cast<int>(work.top),
                                         static_cast<int>(work.bottom) - titleHeight - pictureHeight);
-    SetWindowPos(window_, nullptr, pictureLeft + frame.left, top, pictureWidth + frame.right - frame.left,
+    SetWindowPos(window_, nullptr, pictureLeft + frame.left, top, contentWidth + frame.right - frame.left,
                  pictureHeight + frame.bottom - frame.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    LayoutChildren();  // The window's size may be the same, but not where the panel goes.
 }
 
 void MainWindow::SetWindowSizePercent(int percent) {
@@ -568,36 +874,87 @@ void MainWindow::RestoreWindowPosition(const Settings& settings) {
     startMaximized_ = settings.windowMaximized;
 }
 
-void MainWindow::SaveCurrentSettings() {
+void MainWindow::MoveAwayFromOtherWindows() {
+    const HANDLE lock = CreateMutexW(nullptr, FALSE, kPlacementMutex);
+    const bool locked = lock && WaitForSingleObject(lock, kPlacementWaitMs) != WAIT_TIMEOUT;
+
+    WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    MONITORINFO primary{sizeof(MONITORINFO)};
+    if (GetWindowPlacement(window_, &placement) &&
+        GetMonitorInfoW(MonitorFromRect(&placement.rcNormalPosition, MONITOR_DEFAULTTONEAREST), &monitor) &&
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &primary)) {
+        // A normal position is in workspace coordinates, which start at the primary
+        // monitor's work area instead of at the screen's corner.
+        RECT work = monitor.rcWork;
+        OffsetRect(&work, -primary.rcWork.left, -primary.rcWork.top);
+        const std::vector<POINT> taken = OtherWindowCorners(window_);
+        const int step = MulDiv(kCascadeStep, static_cast<int>(GetDpiForWindow(window_)), 96);
+        const auto isTaken = [&](const RECT& rect) {
+            return std::any_of(taken.begin(), taken.end(), [&](POINT corner) {
+                return std::abs(corner.x - rect.left) < step / 2 && std::abs(corner.y - rect.top) < step / 2;
+            });
+        };
+        RECT rect = placement.rcNormalPosition;
+        for (size_t tries = 0; isTaken(rect) && tries <= taken.size(); ++tries) {
+            OffsetRect(&rect, step, step);
+            // Past the monitor's edge, start again from its top-left corner.
+            if (rect.right > work.right || rect.bottom > work.bottom) {
+                OffsetRect(&rect, work.left - rect.left, work.top - rect.top);
+            }
+        }
+        if (rect.left != placement.rcNormalPosition.left || rect.top != placement.rcNormalPosition.top) {
+            cascadedFrom_ = POINT{placement.rcNormalPosition.left, placement.rcNormalPosition.top};
+            cascadedTo_ = POINT{rect.left, rect.top};
+            placement.rcNormalPosition = rect;
+            placement.showCmd = SW_HIDE;
+            restoringPosition_ = true;
+            SetWindowPlacement(window_, &placement);
+            restoringPosition_ = false;
+            // Centering would put it back on top of the others.
+            centerOnFirstFit_ = false;
+        }
+    }
+    if (locked) {
+        ReleaseMutex(lock);
+    }
+    if (lock) {
+        CloseHandle(lock);
+    }
+}
+
+void MainWindow::SaveCurrentSettings(const Preferences* changedFrom) {
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
     if (fullscreen_) {
         placement = restorePlacement_;
     } else if (!GetWindowPlacement(window_, &placement)) {
         return;
     }
-    Settings settings;
+    // Another window may have saved since this one started, so what it saved is kept
+    // except for what this window sets.
+    Settings settings = LoadSettings();
     settings.volume = playback_.volume;
     settings.subtitleEncoding = playback_.subtitleEncoding;
-    settings.windowPosition = placement.rcNormalPosition;
+    RECT position = placement.rcNormalPosition;
+    // Moved out of another window's way, and not moved since: the place to remember is
+    // the one it would have had.
+    if (cascadedFrom_ && position.left == cascadedTo_.x && position.top == cascadedTo_.y) {
+        OffsetRect(&position, cascadedFrom_->x - position.left, cascadedFrom_->y - position.top);
+    }
+    // Without the width added for the panel, which is added again when it opens next time.
+    if (panelOpen_ && panelBeside_) {
+        position.right -= PanelPixels();
+    }
+    settings.windowPosition = position;
     settings.videoAdjustments = playback_.adjustments;
-    settings.preferences = preferences_;
+    settings.playlistPanelOpen = panelOpen_;
+    settings.playlistPanelWidth = panelWidth_;
+    if (changedFrom) {
+        TakeChangedPreferences(*changedFrom, preferences_, settings.preferences);
+    }
     settings.windowMaximized = placement.showCmd == SW_SHOWMAXIMIZED ||
                                (placement.showCmd == SW_SHOWMINIMIZED && (placement.flags & WPF_RESTORETOMAXIMIZED) != 0);
     SaveSettings(settings);
-}
-
-void MainWindow::HandleCopyData(const COPYDATASTRUCT& data) {
-    if (data.dwData != kOpenPathMessageId) {
-        return;
-    }
-    if (IsIconic(window_)) {
-        ShowWindow(window_, SW_RESTORE);
-    }
-    SetForegroundWindow(GetLastActivePopup(window_));  // The settings window, if it's open.
-    const size_t length = data.cbData / sizeof(wchar_t);
-    if (data.lpData && length > 0) {
-        OpenFromExplorer(std::wstring(static_cast<const wchar_t*>(data.lpData), length));
-    }
 }
 
 void MainWindow::RunDialog(const std::function<void()>& show) {
@@ -648,8 +1005,8 @@ void MainWindow::ApplyPreferences(const Preferences& preferences) {
     if (!(preferences.subtitleStyle == preferences_.subtitleStyle)) {
         player_->SetSubtitleStyle(preferences.subtitleStyle);
     }
-    preferences_ = preferences;
-    SaveCurrentSettings();
+    const Preferences before = std::exchange(preferences_, preferences);
+    SaveCurrentSettings(&before);
 }
 
 LRESULT CALLBACK MainWindow::WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -668,11 +1025,23 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND window, UINT message, WPARAM wParam
 LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_SIZE:
+        if (wParam == SIZE_MAXIMIZED) {
+            wasMaximized_ = true;
+        } else if (wParam == SIZE_RESTORED && std::exchange(wasMaximized_, false)) {
+            PostMessageW(window_, WM_PLACE_PANEL, 0, 0);
+        }
         LayoutChildren();
         return 0;
-    case WM_COPYDATA:
-        HandleCopyData(*reinterpret_cast<const COPYDATASTRUCT*>(lParam));
-        return TRUE;
+    case WM_PLACE_PANEL:
+        PlacePanelBesideIfRoom();
+        LayoutChildren();
+        return 0;
+    case WM_FILES_COLLECTED:
+        HandleFilesCollected(lParam);
+        return 0;
+    case WM_RBUTTONDOWN:
+        SetFocus(window_);  // Away from the panel's list, so the keys are the player's again.
+        return 0;
     case WM_DPICHANGED: {
         if (restoringPosition_) {
             LayoutChildren();
@@ -742,9 +1111,6 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (!retryPath_.empty()) {
                 OpenVideo(retryPath_, retrySubtitle_);
             }
-        } else if (wParam == kSeriesTimer) {
-            KillTimer(window_, kSeriesTimer);
-            FindSeriesInBackground();
         }
         return 0;
     case WM_SERIES_FOUND:
@@ -799,11 +1165,18 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 void MainWindow::LayoutChildren() {
     RECT client{};
     GetClientRect(window_, &client);
+    // Beside the video, the panel takes its width from the video. Over it, it only covers it.
+    // Either way the bar stops at the panel, so the two never hide each other.
+    const int panel = panelOpen_ && playlistPanel_ ? std::min(PanelPixels(), static_cast<int>(client.right)) : 0;
+    const int videoWidth = PanelBesideVideo() ? client.right - panel : client.right;
     if (videoWindow_) {
-        MoveWindow(videoWindow_, 0, 0, client.right, client.bottom, TRUE);
+        MoveWindow(videoWindow_, 0, 0, videoWidth, client.bottom, TRUE);
     }
     if (controlBar_) {
-        controlBar_->Resize(client.right, client.bottom, GetDpiForWindow(window_));
+        controlBar_->Resize(client.right - panel, client.bottom, GetDpiForWindow(window_));
+    }
+    if (panel > 0) {
+        playlistPanel_->Place(RECT{client.right - panel, 0, client.right, client.bottom});
     }
 }
 
@@ -970,6 +1343,9 @@ void MainWindow::RunShortcut(ShortcutAction action) {
         break;
     case ShortcutAction::PlaylistPrevious:
         PlayPrevious();
+        break;
+    case ShortcutAction::PlaylistPanel:
+        TogglePlaylistPanel();
         break;
     case ShortcutAction::Count:
         break;
@@ -1264,6 +1640,7 @@ void MainWindow::HandleMouseLeave() {
 }
 
 void MainWindow::HandleLeftButtonDown(POINT point) {
+    SetFocus(window_);  // Away from the panel's list, so the keys are the player's again.
     switch (controlBar_->HitTest(point)) {
     case ControlBar::Part::PlayPause:
         player_->TogglePause();
@@ -1349,7 +1726,11 @@ void MainWindow::HandleIdleTimeout() {
     if (!playback_.paused || dialogOpen_) {
         controlBar_->SetVisible(false);
     }
-    if (fullscreen_ && !dialogOpen_) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const HWND under = WindowFromPoint(cursor);
+    const bool overPanel = panelOpen_ && (under == playlistPanel_->Window() || IsChild(playlistPanel_->Window(), under));
+    if (fullscreen_ && !dialogOpen_ && !overPanel) {
         SetCursorHidden(true);
     }
 }
@@ -1427,6 +1808,7 @@ void MainWindow::HandleStateChanged(const PlaybackState& state) {
         }
     }
     controlBar_->SetPlayback(state);
+    AnnounceIfReady();
 
     if (reachedEnd && preferences_.autoAdvance && preferences_.repeat != RepeatMode::One) {
         PlayNext(true);
@@ -1462,6 +1844,10 @@ void MainWindow::SetFullscreen(bool fullscreen) {
     }
     fullscreen_ = fullscreen;
     controlBar_->SetFullscreenState(fullscreen);
+    if (!fullscreen) {
+        PlacePanelBesideIfRoom();
+    }
+    LayoutChildren();
     ShowControls();
 }
 

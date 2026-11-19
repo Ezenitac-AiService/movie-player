@@ -49,6 +49,7 @@ constexpr std::array<ShortcutInfo, kShortcutCount> kShortcuts{{
     {L"PlaylistShow", L"재생 목록", VK_F6, false},
     {L"PlaylistNext", L"다음 파일", VK_NEXT, false},
     {L"PlaylistPrevious", L"이전 파일", VK_PRIOR, false},
+    {L"PlaylistPanel", L"재생 목록 패널", VK_F7, false},
 }};
 
 std::wstring KeyName(int key) {

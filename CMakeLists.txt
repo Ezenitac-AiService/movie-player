@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(MoviePlayer VERSION 0.2.0 LANGUAGES CXX RC)
+project(MoviePlayer VERSION 0.3.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,7 @@ add_executable(MoviePlayer WIN32
     src/MpvPlayer.cpp
     src/PlaybackInfo.cpp
     src/Playlist.cpp
+    src/PlaylistPanel.cpp
     src/Settings.cpp
     src/SettingsDialog.cpp
     src/Shortcuts.cpp
@@ -50,7 +51,7 @@ add_executable(MoviePlayer WIN32
 
 target_compile_definitions(MoviePlayer PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(MoviePlayer PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /utf-8>)
-target_link_libraries(MoviePlayer PRIVATE libmpv comctl32 comdlg32 ole32 shell32 shlwapi imm32 advapi32 d3d11 dxgi d2d1 dwrite dcomp)
+target_link_libraries(MoviePlayer PRIVATE libmpv comctl32 comdlg32 ole32 shell32 shlwapi uxtheme dwmapi imm32 advapi32 d3d11 dxgi d2d1 dwrite dcomp)
 
 # The executable loads libmpv-2.dll from its own folder.
 add_custom_command(TARGET MoviePlayer POST_BUILD

@@ -129,6 +129,11 @@ Settings LoadSettings() {
     const std::wstring repeat = ReadText(path, kPlaylistSection, L"Repeat");
     preferences.repeat = repeat == L"one" ? RepeatMode::One : repeat == L"all" ? RepeatMode::All : RepeatMode::None;
     preferences.fitWindowOnPlaylistChange = ReadInt(path, kPlaylistSection, L"FitWindow") == 1;
+    settings.playlistPanelOpen = ReadInt(path, kPlaylistSection, L"PanelOpen") == 1;
+    const int panelWidth = ReadInt(path, kPlaylistSection, L"PanelWidth");
+    if (panelWidth >= kMinPlaylistPanelWidth && panelWidth <= kMaxPlaylistPanelWidth) {
+        settings.playlistPanelWidth = panelWidth;
+    }
     const int heightPercent = ReadInt(path, kSubtitleSection, L"HeightPercent");
     if (heightPercent >= 0 && heightPercent <= kMaxSubtitleHeightPercent) {
         preferences.subtitleStyle.heightPercent = heightPercent;
@@ -194,6 +199,8 @@ void SaveSettings(const Settings& settings) {
     WriteText(path, kPlaylistSection, L"Repeat",
               preferences.repeat == RepeatMode::One ? L"one" : preferences.repeat == RepeatMode::All ? L"all" : L"none");
     WriteInt(path, kPlaylistSection, L"FitWindow", preferences.fitWindowOnPlaylistChange ? 1 : 0);
+    WriteInt(path, kPlaylistSection, L"PanelOpen", settings.playlistPanelOpen ? 1 : 0);
+    WriteInt(path, kPlaylistSection, L"PanelWidth", settings.playlistPanelWidth);
     // Only changed keys are stored, so a future change to a default reaches everyone else.
     for (size_t i = 0; i < kShortcutCount; ++i) {
         const ShortcutInfo& info = AllShortcuts()[i];

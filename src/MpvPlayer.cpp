@@ -420,9 +420,10 @@ void MpvPlayer::SetSubtitleEncoding(SubtitleEncoding encoding) {
     callbacks_.stateChanged(state_);
 }
 
-void MpvPlayer::ShowMessage(const std::wstring& text) {
+void MpvPlayer::ShowMessage(const std::wstring& text, int milliseconds) {
     const std::string utf8Text = ToUtf8(text);
-    Command({"show-text", utf8Text.c_str()});
+    const std::string duration = std::to_string(milliseconds);
+    Command({"show-text", utf8Text.c_str(), duration.c_str()});
 }
 
 void MpvPlayer::Command(std::initializer_list<const char*> arguments, uint64_t replyId) {
