@@ -442,9 +442,15 @@ void SettingsDialog::Apply() {
 
 void SettingsDialog::UpdateAssociationState() {
     const bool registered = IsFileAssociationRegistered();
-    SetDlgItemTextW(dialog_, IDC_ASSOC_STATUS, registered ? L"상태: 등록됨" : L"상태: 등록 안 됨");
+    // What an older version, or this program before it was moved, registered can be
+    // removed too, or replaced by registering again.
+    const bool leftover = !registered && HasFileAssociationEntries();
+    SetDlgItemTextW(dialog_, IDC_ASSOC_STATUS,
+                    registered ? L"상태: 등록됨"
+                    : leftover ? L"상태: 이전 버전이나 다른 위치에서 등록한 내용이 남아 있음"
+                               : L"상태: 등록 안 됨");
     EnableWindow(Item(IDC_ASSOC_REGISTER), !registered);
-    EnableWindow(Item(IDC_ASSOC_UNREGISTER), registered);
+    EnableWindow(Item(IDC_ASSOC_UNREGISTER), registered || leftover);
     EnableWindow(Item(IDC_ASSOC_DEFAULTS), registered);
 }
 

@@ -66,10 +66,43 @@ void NotifyShell() {
 
 }  // namespace
 
-// True only if subtitles are covered too, so a registration from an older version can be redone.
+// Without this, Explorer offers no "Open" once more than 15 files are selected. It starts
+// the program once per file either way, and each file plays in a window of its own.
+constexpr wchar_t kMultiSelectModel[] = L"Player";
+
+// True only if subtitles and many-file selections are covered too, so a registration from
+// an older version can be redone.
 bool IsFileAssociationRegistered() {
-    return GetText(std::wstring(kProgIdKey) + L"\\shell\\open\\command", nullptr) == OpenCommand() &&
-           GetText(std::wstring(kSubtitleProgIdKey) + L"\\shell\\open\\command", nullptr) == OpenCommand();
+    for (const std::wstring key : {std::wstring(kProgIdKey), std::wstring(kSubtitleProgIdKey)}) {
+        if (GetText(key + L"\\shell\\open\\command", nullptr) != OpenCommand() ||
+            GetText(key + L"\\shell\\open", L"MultiSelectModel") != kMultiSelectModel) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HasFileAssociationEntries() {
+    for (const wchar_t* key : {kProgIdKey, kSubtitleProgIdKey, kApplicationKey, kAppKey}) {
+        HKEY handle = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_READ, &handle) == ERROR_SUCCESS) {
+            RegCloseKey(handle);
+            return true;
+        }
+    }
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegisteredApplicationsKey, kRegisteredName, RRF_RT_ANY, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+        return true;
+    }
+    const auto listedFor = [](const auto& extensions, const wchar_t* id) {
+        for (const wchar_t* extension : extensions) {
+            const std::wstring key = std::wstring(L"Software\\Classes\\") + extension + L"\\OpenWithProgids";
+            if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), id, RRF_RT_ANY, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return listedFor(kVideoExtensions, kProgId) || listedFor(kSubtitleExtensions, kSubtitleProgId);
 }
 
 bool RegisterFileAssociation() {
@@ -84,11 +117,13 @@ bool RegisterFileAssociation() {
     for (const auto& [key, name] : {std::pair{progId, L"Movie Player 동영상"}, std::pair{std::wstring(kSubtitleProgIdKey), L"Movie Player 자막"}}) {
         ok = SetText(key, nullptr, name) && ok;
         ok = SetText(key + L"\\DefaultIcon", nullptr, icon) && ok;
+        ok = SetText(key + L"\\shell\\open", L"MultiSelectModel", kMultiSelectModel) && ok;
         ok = SetText(key + L"\\shell\\open\\command", nullptr, command) && ok;
     }
 
     ok = SetText(application, L"FriendlyAppName", kAppName) && ok;
     ok = SetText(application + L"\\DefaultIcon", nullptr, icon) && ok;
+    ok = SetText(application + L"\\shell\\open", L"MultiSelectModel", kMultiSelectModel) && ok;
     ok = SetText(application + L"\\shell\\open\\command", nullptr, command) && ok;
 
     ok = SetText(capabilities, L"ApplicationName", kAppName) && ok;

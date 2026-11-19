@@ -6,6 +6,9 @@
 
 // True if registered, and pointing at this copy of the program.
 bool IsFileAssociationRegistered();
+// True if anything that registering writes is there, from this copy or from any other,
+// such as an older version or one that has since been moved. Unregistering removes it.
+bool HasFileAssociationEntries();
 bool RegisterFileAssociation();
 void UnregisterFileAssociation();
 void OpenDefaultAppsSettings();
