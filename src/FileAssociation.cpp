@@ -66,20 +66,29 @@ void NotifyShell() {
 
 }  // namespace
 
-// Without this, Explorer offers no "Open" once more than 15 files are selected. It starts
-// the program once per file either way, and each file plays in a window of its own.
-constexpr wchar_t kMultiSelectModel[] = L"Player";
+namespace {
 
-// True only if subtitles and many-file selections are covered too, so a registration from
-// an older version can be redone.
+// Version 0.3.0 set this to "Player", so that Explorer would offer "Open" for more than
+// 15 files at once. As each file opens a window of its own, that only gives a screen full
+// of windows all playing at once, so the value is removed. Explorer then keeps the limit.
+constexpr wchar_t kMultiSelectValue[] = L"MultiSelectModel";
+
+bool HasMultiSelectModel(const std::wstring& key) {
+    return RegGetValueW(HKEY_CURRENT_USER, (key + L"\\shell\\open").c_str(), kMultiSelectValue, RRF_RT_ANY, nullptr, nullptr, nullptr) ==
+           ERROR_SUCCESS;
+}
+
+}  // namespace
+
+// True only if subtitles are covered too, and nothing from an older version is left, so
+// such a registration can be redone.
 bool IsFileAssociationRegistered() {
     for (const std::wstring key : {std::wstring(kProgIdKey), std::wstring(kSubtitleProgIdKey)}) {
-        if (GetText(key + L"\\shell\\open\\command", nullptr) != OpenCommand() ||
-            GetText(key + L"\\shell\\open", L"MultiSelectModel") != kMultiSelectModel) {
+        if (GetText(key + L"\\shell\\open\\command", nullptr) != OpenCommand() || HasMultiSelectModel(key)) {
             return false;
         }
     }
-    return true;
+    return !HasMultiSelectModel(kApplicationKey);
 }
 
 bool HasFileAssociationEntries() {
@@ -117,13 +126,13 @@ bool RegisterFileAssociation() {
     for (const auto& [key, name] : {std::pair{progId, L"Movie Player 동영상"}, std::pair{std::wstring(kSubtitleProgIdKey), L"Movie Player 자막"}}) {
         ok = SetText(key, nullptr, name) && ok;
         ok = SetText(key + L"\\DefaultIcon", nullptr, icon) && ok;
-        ok = SetText(key + L"\\shell\\open", L"MultiSelectModel", kMultiSelectModel) && ok;
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, (key + L"\\shell\\open").c_str(), kMultiSelectValue);
         ok = SetText(key + L"\\shell\\open\\command", nullptr, command) && ok;
     }
 
     ok = SetText(application, L"FriendlyAppName", kAppName) && ok;
     ok = SetText(application + L"\\DefaultIcon", nullptr, icon) && ok;
-    ok = SetText(application + L"\\shell\\open", L"MultiSelectModel", kMultiSelectModel) && ok;
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, (application + L"\\shell\\open").c_str(), kMultiSelectValue);
     ok = SetText(application + L"\\shell\\open\\command", nullptr, command) && ok;
 
     ok = SetText(capabilities, L"ApplicationName", kAppName) && ok;
