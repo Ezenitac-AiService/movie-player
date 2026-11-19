@@ -39,7 +39,7 @@ constexpr int kMaxScreenPercent = 90;
 constexpr int kMinVideoWidth = 320;
 constexpr UINT_PTR kIdleTimer = 1;
 constexpr UINT kIdleDelayMs = 2000;
-constexpr UINT_PTR kDropRetryTimer = 3;
+constexpr UINT_PTR kOpenRetryTimer = 3;
 constexpr UINT_PTR kSeriesTimer = 4;
 constexpr UINT WM_SERIES_FOUND = WM_APP + 2;
 // Explorer opens each of several selected files as its own copy of the app, which hands
@@ -52,9 +52,34 @@ struct SeriesResult {
     std::wstring video;
     std::vector<std::wstring> series;
 };
-// Right after a drag from Explorer, a file on a virtual drive such as RaiDrive can open
-// but not yet give its real contents. Opening the same path without a drag works.
-constexpr UINT kDropRetryDelaysMs[] = {500, 1000, 2000};
+// A file on a network share or on a drive that a program provides, such as RaiDrive, can
+// open but not yet give its real contents, especially right after a drag from Explorer.
+// Opening the same path again a moment later works.
+constexpr UINT kOpenRetryDelaysMs[] = {500, 1000, 2000};
+
+// Whether a file may read wrongly at first: anything but an ordinary disk. A drive that
+// a program provides can show up as a network drive or as a local one with its own file
+// system, so the file system is checked too.
+bool MayReadLate(const std::wstring& path) {
+    wchar_t root[MAX_PATH];
+    if (!GetVolumePathNameW(path.c_str(), root, MAX_PATH)) {
+        return true;
+    }
+    const UINT type = GetDriveTypeW(root);
+    if (type == DRIVE_REMOTE || type == DRIVE_UNKNOWN || type == DRIVE_NO_ROOT_DIR) {
+        return true;
+    }
+    wchar_t fileSystem[MAX_PATH + 1] = L"";
+    if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, fileSystem, MAX_PATH + 1)) {
+        return true;
+    }
+    for (const wchar_t* known : {L"NTFS", L"ReFS", L"FAT", L"FAT32", L"exFAT", L"UDF", L"CDFS"}) {
+        if (_wcsicmp(fileSystem, known) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // After a seek is released, keep showing its target until mpv gets there, so the
 // bar doesn't jump back to the old position. The expiry covers a seek that lands
@@ -149,19 +174,31 @@ void MainWindow::Show(int showCommand) {
 }
 
 void MainWindow::HandlePlaybackError(const std::wstring& reason, bool unrecognizedFormat) {
-    if (unrecognizedFormat && !dropRetryPath_.empty() && dropRetryCount_ < std::size(kDropRetryDelaysMs)) {
-        SetTimer(window_, kDropRetryTimer, kDropRetryDelaysMs[dropRetryCount_++], nullptr);
+    if (unrecognizedFormat && !retryPath_.empty() && retryCount_ < std::size(kOpenRetryDelaysMs)) {
+        SetTimer(window_, kOpenRetryTimer, kOpenRetryDelaysMs[retryCount_++], nullptr);
         return;
     }
-    dropRetryPath_.clear();
+    CancelOpenRetry();
     currentVideoPath_.clear();
     const std::wstring text = L"동영상을 재생할 수 없습니다.\n\n" + reason;
     MessageBoxW(window_, text.c_str(), kAppTitle, MB_OK | MB_ICONERROR);
 }
 
+void MainWindow::ArmOpenRetry(const std::wstring& path, const std::wstring& preferredSubtitle) {
+    KillTimer(window_, kOpenRetryTimer);
+    retryPath_ = path;
+    retrySubtitle_ = preferredSubtitle;
+    retryCount_ = 0;
+}
+
+void MainWindow::CancelOpenRetry() {
+    KillTimer(window_, kOpenRetryTimer);
+    retryPath_.clear();
+    retrySubtitle_.clear();
+}
+
 void MainWindow::Open(const std::wstring& path) {
-    KillTimer(window_, kDropRetryTimer);
-    dropRetryPath_.clear();
+    // A subtitle joins the video being opened, so it leaves a retry of that video alone.
     lastExplorerOpen_ = 0;
     if (IsSubtitleFile(path)) {
         AddSubtitle(path);
@@ -185,8 +222,6 @@ void MainWindow::OpenFiles(const std::vector<std::wstring>& paths) {
             Open(path);
         }
     } else {
-        KillTimer(window_, kDropRetryTimer);
-        dropRetryPath_.clear();
         lastExplorerOpen_ = 0;
         SortByName(videos);
         StartPlaylist(std::move(videos), 0, {}, false);
@@ -200,6 +235,10 @@ void MainWindow::StartPlaylist(std::vector<std::wstring> files, size_t index, co
     ++seriesSearch_;
     KillTimer(window_, kSeriesTimer);
     OpenVideo(playlist_[playlistIndex_], preferredSubtitle);
+    CancelOpenRetry();
+    if (MayReadLate(playlist_[playlistIndex_])) {
+        ArmOpenRetry(playlist_[playlistIndex_], preferredSubtitle);
+    }
     ShowControls();
     // The file plays at once; the rest of its series is looked for after a moment, which
     // also leaves time for more files of a selection to arrive from Explorer.
@@ -240,11 +279,13 @@ void MainWindow::PlayPlaylistItem(size_t index) {
     if (index >= playlist_.size()) {
         return;
     }
-    KillTimer(window_, kDropRetryTimer);
-    dropRetryPath_.clear();
     playlistIndex_ = index;
     keepWindowSize_ = !preferences_.fitWindowOnPlaylistChange;
     OpenVideo(playlist_[index]);
+    CancelOpenRetry();
+    if (MayReadLate(playlist_[index])) {
+        ArmOpenRetry(playlist_[index], {});
+    }
     player_->ShowMessage(std::to_wstring(index + 1) + L"/" + std::to_wstring(playlist_.size()) + L": " +
                          std::filesystem::path(playlist_[index]).filename().wstring());
     ShowControls();
@@ -358,8 +399,6 @@ void MainWindow::OpenFromExplorer(const std::wstring& path) {
     }
     const std::wstring video = FindVideoForSubtitle(path);
     if (!video.empty() && _wcsicmp(video.c_str(), currentVideoPath_.c_str()) != 0) {
-        KillTimer(window_, kDropRetryTimer);
-        dropRetryPath_.clear();
         lastExplorerOpen_ = 0;
         StartPlaylist({video}, 0, path, true);
     } else if (!currentVideoPath_.empty()) {
@@ -433,7 +472,7 @@ void MainWindow::ApplyDefaultWindowSize() {
 }
 
 void MainWindow::HandleVideoReady(int width, int height) {
-    dropRetryPath_.clear();
+    CancelOpenRetry();
     if (!pendingSubtitleName_.empty()) {
         for (const MediaTrack& track : playback_.tracks) {
             if (track.type == TrackType::Subtitle && _wcsicmp(track.externalFileName.c_str(), pendingSubtitleName_.c_str()) == 0) {
@@ -698,10 +737,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             HandleIdleTimeout();
         } else if (wParam == ControlBar::kFadeTimerId && controlBar_) {
             controlBar_->HandleFadeTimer();
-        } else if (wParam == kDropRetryTimer) {
-            KillTimer(window_, kDropRetryTimer);
-            if (!dropRetryPath_.empty()) {
-                OpenVideo(dropRetryPath_);
+        } else if (wParam == kOpenRetryTimer) {
+            KillTimer(window_, kOpenRetryTimer);
+            if (!retryPath_.empty()) {
+                OpenVideo(retryPath_, retrySubtitle_);
             }
         } else if (wParam == kSeriesTimer) {
             KillTimer(window_, kSeriesTimer);
@@ -739,7 +778,7 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         SaveCurrentSettings();
-        KillTimer(window_, kDropRetryTimer);
+        KillTimer(window_, kOpenRetryTimer);
         // mpv renders into videoWindow_, so stop it before the window goes away.
         player_.reset();
         controlBar_.reset();
@@ -1330,9 +1369,9 @@ void MainWindow::HandleDroppedFiles(HDROP drop) {
 
     if (!paths.empty()) {
         OpenFiles(paths);
+        // Right after a drag a file can read wrongly on any drive, so a drop always retries.
         if (!playlist_.empty() && !IsSubtitleFile(paths.front())) {
-            dropRetryPath_ = playlist_[playlistIndex_];
-            dropRetryCount_ = 0;
+            ArmOpenRetry(playlist_[playlistIndex_], {});
         }
         SetForegroundWindow(window_);
     }

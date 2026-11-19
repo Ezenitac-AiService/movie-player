@@ -103,6 +103,8 @@ private:
     void ApplyDefaultWindowSize();
     void HandleVideoReady(int width, int height);
     void HandlePlaybackError(const std::wstring& reason, bool unrecognizedFormat);
+    void ArmOpenRetry(const std::wstring& path, const std::wstring& preferredSubtitle);
+    void CancelOpenRetry();
     // Sizes the window to show the video at this scale, as far as the monitor allows.
     void FitWindowToVideo(double requestedScale, bool center);
     void SetWindowSizePercent(int percent);
@@ -130,8 +132,11 @@ private:
     ULONGLONG lastExplorerOpen_ = 0;  // When a video last came from Explorer, to group a multi-file selection.
     unsigned seriesSearch_ = 0;  // Counts searches, so a late result for an old playlist is ignored.
 
-    std::wstring dropRetryPath_;  // The dropped video being opened. Empty once it's settled.
-    size_t dropRetryCount_ = 0;
+    // The video being opened, kept for another try in case it reads wrongly at first.
+    // Empty once it has settled, or when it's on a drive that doesn't need this.
+    std::wstring retryPath_;
+    std::wstring retrySubtitle_;
+    size_t retryCount_ = 0;
 
     bool restoringPosition_ = false;
     bool startMaximized_ = false;
